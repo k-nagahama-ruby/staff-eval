@@ -1,251 +1,216 @@
-## Staff Evaluation App — CLOUDE.md Summary (Next.js + Supabase)
+# Staff Evaluation App — CLAUDE.md
 
-### Goal
+## Overview
 
-Digitize a paper-based staff evaluation process into a small internal web app (≈26 employees), used **twice a year**.
-Managers evaluate their team members, employees can view only their own results, the President sees company-wide distributions, and **System Admin** manages configuration and master data.
+Digitize TWM's paper-based employee evaluation process into a secure internal web app (~26 employees). Used **twice a year** for performance reviews.
+
+**Tech Stack:** Next.js (React) + Supabase (Postgres, Auth, RLS)
 
 ---
 
 ## Core Roles & Permissions
 
-### Roles
-
-- **System Admin**
-- **President**
-- **Manager**
-- **Employee**
+| Role | Capabilities |
+|------|-------------|
+| **System Admin** | Full system config, manage cycles/templates/users, view all data |
+| **President** | Read-only access to all reviews, company-wide analytics |
+| **Manager** | Create/edit reviews for direct reports only, view team summaries |
+| **Employee** | View own reviews only (read-only after submission) |
 
 ---
 
-### Permission Rules (enforced via Supabase RLS)
+## Data Model (Supabase)
 
-#### System Admin
+### Tables
 
-- Full access to **system configuration**
-- Can:
-  - Create / edit / delete **review cycles**
-  - Create / edit / delete **evaluation question sets** and questions
-  - Manage **organizational data** (departments, manager–employee relationships)
-  - View all reviews and answers (read-only by default; write access only if needed)
+```
+profiles
+├── id (uuid, pk, = auth.users.id)
+├── name (text)
+├── role (text: system_admin | president | manager | employee)
+├── department (text)
+├── manager_id (uuid, nullable → profiles.id)
+└── created_at (timestamptz)
 
-- Does **not** participate in evaluations as a reviewer by default
+review_cycles
+├── id (uuid)
+├── name (text)
+├── start_date (date)
+├── end_date (date)
+├── status (text: draft | active | closed)
+└── created_at (timestamptz)
 
-#### President
+question_templates
+├── id (uuid)
+├── version (int4)
+├── section (text)
+├── prompt (text)
+├── type (text: rating | text | choice)
+├── is_required (bool)
+├── sort_order (int4)
+└── created_at (timestamptz)
 
-- Read-only access to **all submitted reviews**
-- Can view:
-  - Company-wide summary dashboards
-  - “Distribution for the president” (overall_band, total_score)
+reviews
+├── id (uuid)
+├── employee_id (uuid → profiles.id)
+├── manager_id (uuid → profiles.id)
+├── cycle_id (uuid → review_cycles.id)
+├── template_version (uuid)
+├── status (text: draft | submitted | locked)
+├── total_score (int4)
+├── overall_band (text: below | meets | exceeds)
+├── created_at (timestamptz)
+├── submitted_at (timestamptz)
+└── locked_at (timestamptz)
 
-- No editing of reviews or questions
+review_answers
+├── id (uuid)
+├── review_id (uuid → reviews.id)
+├── question_id (uuid → question_templates.id)
+├── rating_value (int4, 1-5)
+├── choice_value (text: exceeded | achieved | not_achieved)
+└── text_value (text)
+```
 
-#### Manager
+**Unique constraint:** `review_answers(review_id, question_id)` → enables upsert
 
-- Can:
-  - Create and edit reviews **only for their direct reports**
-  - Fill in evaluation answers
-  - Submit reviews
+---
 
-- Can view:
-  - Summary charts for **their own team only**
+## Evaluation Form Structure
 
-#### Employee
+### 1. Performance Rating Scale (3-Point)
+- **Exceeded** - Performance far exceeded expectations
+- **Achieved** - Performance consistently met expectations
+- **Not Achieved** - Performance did not consistently meet expectations
 
-- Can:
-  - View **only their own** reviews
+### 2. Scale Questions (1-5)
+15 questions rated 1 (Poor) to 5 (Excellent):
+- Stress handling, deadlines, communication, adaptability
+- Problem-solving, leadership, initiative, workload management
+- Feedback reception, cross-team communication, time management
+- Flexibility, ethical behavior, going above and beyond
 
-- Cannot:
-  - View others’ reviews
-  - Edit submitted reviews
+### 3. Open-Ended Questions
+20 text questions covering:
+- Strengths and achievements
+- Areas for improvement
+- Team contribution and collaboration
+- Growth and development needs
+
+### 4. Conclusion Ratings
+- Core Competencies & Values (3-point)
+- Employee Strengths & Achievements (3-point)
+- Areas of Improvement (text)
+- Manager's Comments (text)
+- Future Goals (text)
+
+### 5. Overall Rating (Auto-calculated)
+| Score Range | Rating |
+|-------------|--------|
+| ≤30 points | Below Expectations |
+| 45-50 points | Meets Expectations |
+| >60 points | Exceeds Expectations |
+| 31-44, 51-60 | Unmapped (admin must configure) |
+
+---
+
+## RLS Policy Requirements
+
+### Security Functions (SECURITY DEFINER)
+```sql
+is_system_admin(uid) → boolean
+is_direct_report(manager_uid, employee_uid) → boolean
+```
+
+### Access Rules
+
+**reviews table:**
+- System Admin: full access
+- Manager: `reviewer_id = auth.uid()` AND reviewee is direct report
+- Employee: `reviewee_id = auth.uid()` (read-only)
+- President: read-only, all rows
+
+**review_answers table:**
+- Access controlled via parent review relationship
+
+**question_templates / review_cycles:**
+- Editable only by System Admin
+- Read access for all authenticated users
+
+---
+
+## Status & Lock Rules
+
+1. Reviews start as `draft`
+2. On submit:
+   - `status = 'submitted'`
+   - `submitted_at = now()`
+   - `total_score` and `overall_band` computed and stored
+3. Submitted reviews:
+   - Read-only in UI
+   - RLS blocks updates (except admin reopen)
 
 ---
 
 ## MVP Pages
 
 ### System Admin
-
-1. **System Settings**
-   - Manage review cycles
-   - Manage evaluation question sets (versioned)
-   - Manage departments and reporting lines (manager_id)
-
----
+- **System Settings** - Manage cycles, question templates (versioned), departments, reporting lines
 
 ### Manager
-
-2. **My Team Reviews**
-   - List of reviews for direct reports
-   - Filter by:
-     - Review cycle
-     - Status (draft / submitted)
-
-3. **Review Editor**
-   - Load questions from a versioned question set
-   - Upsert answers
-   - Submit review (locks it)
-
----
+- **My Team Reviews** - List reviews for direct reports, filter by cycle/status
+- **Review Editor** - Load questions, fill answers, submit (locks review)
 
 ### Employee
-
-4. **My Reviews**
-   - View own reviews only
-   - Read-only once submitted
-
----
+- **My Reviews** - View own reviews only (read-only after submission)
 
 ### President
-
-5. **Summary Dashboard**
-   - Company-wide distributions:
-     - overall_band
-     - total_score
-
-   - Breakdowns:
-     - by department
-     - by manager
-     - by review cycle
-
-   - Dedicated **“distribution for the president”** view
-
----
-
-## Data Model (Supabase)
-
-### Profiles / Organization
-
-`profiles`
-
-- `id (uuid, pk, auth.users.id)`
-- `name`
-- `role` (`system_admin | president | manager | employee`)
-- `department_id`
-- `manager_id (nullable → profiles.id)`
-
----
-
-### Review Cycles
-
-`review_cycles`
-
-- `id (uuid)`
-- `name`
-- `start_date`
-- `end_date`
-- `status` (draft / active / closed)
-- `created_at`
-
----
-
-### Evaluation Questions (Versioned)
-
-`question_sets`
-
-- `id (uuid)`
-- `name`
-- `version`
-- `created_at`
-
-`questions`
-
-- `id (uuid)`
-- `question_set_id (fk)`
-- `order_index`
-- `text`
-- `type` (rating / text / etc.)
-
----
-
-### Reviews
-
-`reviews`
-
-- `id (uuid)`
-- `cycle_id`
-- `reviewee_id`
-- `reviewer_id`
-- `question_set_id`
-- `status` (draft / submitted / locked)
-- `submitted_at`
-- `total_score`
-- `overall_band`
-
----
-
-### Answers
-
-`review_answers`
-
-- `id (uuid)`
-- `review_id`
-- `question_id`
-- `value_numeric`
-- `value_text`
-- `updated_at`
-
-**Unique constraint:** `(review_id, question_id)`
-→ Enables upsert
-
----
-
-## RLS Policy Requirements (Critical)
-
-- **System Admin**
-  - Can bypass most restrictions (explicit role check)
-
-- **Reviews**
-  - Manager: `reviewer_id = auth.uid()` AND reviewee is direct report
-  - Employee: `reviewee_id = auth.uid()`
-  - President: read-only, all rows
-
-- **Review Answers**
-  - Access controlled via parent review
-
-- **Question Sets / Cycles**
-  - Editable only by System Admin
-
-- Prefer **SECURITY DEFINER SQL functions** for:
-  - `is_system_admin(uid)`
-  - `is_direct_report(manager_uid, employee_uid)`
-
----
-
-## Status & Lock Rules
-
-- Reviews start as `draft`
-- On submit:
-  - `status = submitted`
-  - `submitted_at = now()`
-
-- Submitted reviews:
-  - Read-only in UI
-  - RLS blocks updates
+- **Summary Dashboard** - Company-wide distributions (overall_band, total_score), breakdowns by department/manager/cycle
 
 ---
 
 ## Dashboard Strategy
 
-- Store `total_score` and `overall_band` on submit (simplest MVP)
-- Dashboards query `reviews` directly
-- President dashboard is company-wide
-- Manager dashboard is team-scoped
-
----
-
-## Tech Stack
-
-- **Next.js (React)**
-- **Supabase** (Postgres, Auth, RLS)
-- Chart library for pie / distribution graphs
-- `.env.local` with public Supabase keys
+- Store `total_score` and `overall_band` on submit
+- Query `reviews` table directly for dashboards
+- President dashboard: company-wide scope
+- Manager dashboard: team-scoped (direct reports only)
+- Charts: distribution histograms, pie/donut charts
 
 ---
 
 ## MVP Acceptance Criteria
 
-- System Admin can fully configure cycles and questions
-- Managers can evaluate only their team
-- Employees can see only their own results
-- President can see company-wide distributions
-- RLS guarantees zero data leakage even with malicious requests
+1. System Admin can fully configure cycles and question templates
+2. Managers can evaluate only their direct reports
+3. Employees can see only their own results
+4. President can see company-wide distributions
+5. RLS guarantees zero data leakage
+6. Total score and overall rating computed on submit
+7. Template versioning works for future cycles
+
+---
+
+## Key Files Reference
+
+- `er-diagram.png` - Database ER diagram
+- `requirement-define.md` - Full requirement specification
+- `employee-evaluation-form.md` - Actual question templates from paper form
+
+---
+
+## Development Notes
+
+### Scoring Validation
+- Scale questions: reject values outside 1-5
+- Show missing questions on submit attempt
+- Handle score gaps (31-44, 51-60) with admin-configurable thresholds
+
+### Change Control
+- Active cycles: restrict template changes
+- Allow only non-breaking edits (label/help text) once submissions exist
+
+### Privacy
+- Open-ended text contains sensitive feedback
+- Enforce "least privilege" access
+- Track audit events: review_created, review_updated, review_submitted, etc.
